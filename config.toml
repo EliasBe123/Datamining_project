@@ -1,0 +1,18 @@
+# Periods are half-open: discovery [0, 14 days), evaluation [14, 28 days).
+period_days = 14
+bin_seconds = 300
+rssi_threshold = -80
+coverage_threshold = 0.5
+recurrence_days = 3
+many_proximity_bins = 12
+min_rule_count = 20
+min_confidence = 0.6
+min_lift = 1.0
+max_itemset_size = 3
+distance_cutoff = 0.8
+min_group_size = 3
+combined_weights = [0.8, 0.1, 0.1] # Bluetooth, calls, SMS
+permutations = 1000
+seed = 42
+sensitivity_rssi = [-75, -85]
+sensitivity_cutoffs = [0.7, 0.9]

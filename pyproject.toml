@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cns-groups"
+version = "0.1.0"
+description = "Group 42 learning scaffold: recurring student interaction groups"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26,<3", "pandas>=2.2,<3", "scipy>=1.12,<2",
+  "scikit-learn>=1.4,<2", "mlxtend>=0.23.4,<0.24", "matplotlib>=3.8,<4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+cns-groups = "cns_groups.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
