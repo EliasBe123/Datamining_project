@@ -9,16 +9,19 @@ running every analysis. See HANDOFFS.md for the exact shared column names.
 You may add private helper functions inside this file as you work.
 """
 from pathlib import Path
-
+import numpy as np
 import pandas as pd
 
 from .config import Config
 from .contracts import ProcessedData
-
+PAIR = ["user_a", "user_b"]
+FEATURES = ["proximity_bins", "proximity_days", "sms_count", "sms_days",
+            "completed_calls", "call_days", "call_attempts"]
+SCHEMAS = {"bt": ["timestamp", *PAIR, "rssi"],
+           "calls": ["timestamp", *PAIR, "duration"], "sms": ["timestamp", *PAIR]}
 
 def clean_records(frame: pd.DataFrame, kind: str, cfg: Config) -> pd.DataFrame:
     """TODO 1: return cleaned events with canonical COLUMN names and time columns.
-
     Inputs:
       kind = 'bt', 'calls', or 'sms'. Raw headers differ between files.
       Bluetooth: '# timestamp', user_a, user_b, rssi.
@@ -38,7 +41,87 @@ def clean_records(frame: pd.DataFrame, kind: str, cfg: Config) -> pd.DataFrame:
     Check by hand: timestamp == cfg.period_seconds belongs to period 1.
     A single malformed value should not silently change the remaining rows.
     """
-    raise NotImplementedError("Processing task 1: clean_records")
+    frame = frame.copy()
+
+    frame.columns = (
+        frame.columns
+        .str.strip()
+        .str.lstrip("#")
+        .str.strip()
+    )
+
+    frame = frame.rename(columns={
+        "caller": "user_a",
+        "callee": "user_b",
+        "sender": "user_a",
+        "recipient": "user_b",
+    })
+    #Validate schema
+    if list(frame.columns) != SCHEMAS[kind]:
+      raise ValueError(f"Unexpected columns: {list(frame.columns)}")
+    for column in SCHEMAS[kind]:
+      frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    valid = np.isfinite(frame[SCHEMAS[kind]]).all(axis=1)
+
+    for column in SCHEMAS[kind]:
+       valid &= frame[column].eq(np.floor(frame[column]))
+    
+    valid &= frame["user_a"].ne(frame["user_b"])
+    frame = frame[valid].copy()
+    #remove rows with invalid user_a values
+    before = len(frame)
+
+    frame = frame[frame["user_a"].ge(0)].copy()
+
+    excluded = before - len(frame)
+    print(f"Excluded {excluded} rows with negative or invalid user_a values.")
+
+    if kind == "calls" or kind == "sms":
+        #remove rows with invalid user_b values for calls and sms
+        before = len(frame)
+
+        frame = frame[frame["user_b"].ge(0)].copy()
+
+        excluded = before - len(frame)
+        print(f"Excluded {excluded} rows with negative or invalid user_b values for calls and sms.")
+    
+    if kind == "calls":
+        #remove rows with invalid duration values for calls
+        before = len(frame)
+
+        frame = frame[frame["duration"].ge(-1)].copy()
+
+        excluded = before - len(frame)
+        print(f"Excluded {excluded} rows with invalid duration values for calls.")
+    
+    if kind == "bt":
+        #remove rows with invalid user_b values for bluetooth
+        before = len(frame)
+
+        frame = frame[frame["user_b"].ge(-2)].copy()
+
+        excluded = before - len(frame)
+        print(f"Excluded {excluded} rows with invalid user_b values for bluetooth.")
+
+        #remove rows with invalid bluetooth RSSI values
+        before = len(frame)
+
+        frame = frame[frame["rssi"].le(0)].copy()
+
+        excluded = before - len(frame)
+        print(f"Excluded {excluded} rows with invalid rssi values.")
+    inside_window = (
+    frame["timestamp"].ge(0)
+    & frame["timestamp"].lt(2 * cfg.period_seconds)
+  )
+
+    frame = frame.loc[inside_window].copy()
+    frame = frame.astype("int64")
+
+    frame["bin"] = frame["timestamp"] // cfg.bin_seconds
+    frame["day"] = frame["timestamp"] // 86400
+    frame["period"] = frame["timestamp"] // cfg.period_seconds
+    return frame
 
 
 def observation_coverage(bt: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -53,6 +136,23 @@ def observation_coverage(bt: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     Check: observed with no peers is different from having no observation.
     Student identifiers are nominal labels, not quantities to compare numerically.
     """
+    scanning_students = bt[["user_a", "bin", "period"]].rename(columns={"user_a": "user"})
+    detected_students = bt.loc[bt.user_b.ge(0), ["user_b", "bin", "period"]].rename(columns={"user_b": "user"})
+    observations = pd.concat(
+      [scanning_students, detected_students],
+      ignore_index=True,
+  )
+
+    observations = observations.drop_duplicates(["user", "bin"])
+
+    counts = (
+      observations
+      .groupby(["user", "period"])
+      .size()
+      .unstack(fill_value=0)
+  )
+    
+    
     raise NotImplementedError("Processing task 2: observation_coverage")
 
 
@@ -88,4 +188,12 @@ def run(raw: Path, cfg: Config) -> ProcessedData:
     The CLI handles saving these tables. No need to implement file handoffs here.
     First acceptance check: python -m pytest tests/test_exercises.py -q
     """
+    bt_sym = pd.read_csv(raw / "bt_symmetric.csv")
+    calls = pd.read_csv(raw / "calls.csv")
+    sms = pd.read_csv(raw / "sms.csv")
+    clean_bt = clean_records(bt_sym, "bt", cfg)
+    clean_calls = clean_records(calls, "calls", cfg)
+    clean_sms = clean_records(sms, "sms", cfg)
+
     raise NotImplementedError("Processing task 4: run")
+
