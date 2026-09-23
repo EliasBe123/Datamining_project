@@ -152,9 +152,47 @@ def observation_coverage(bt: pd.DataFrame, cfg: Config) -> pd.DataFrame:
       .unstack(fill_value=0)
   )
     
-    
-    raise NotImplementedError("Processing task 2: observation_coverage")
+    counts = counts.reindex(columns=[0, 1], fill_value=0)
+    counts.columns = ["discovery_bins", "evaluation_bins"]
 
+    possible_bins = cfg.period_seconds // cfg.bin_seconds
+
+    counts["discovery_coverage"] = (
+        counts["discovery_bins"] / possible_bins
+    )
+
+    counts["evaluation_coverage"] = (
+        counts["evaluation_bins"] / possible_bins
+    )
+
+    counts["discovery_eligible"] = (
+      counts["discovery_coverage"] >= cfg.coverage_threshold
+    )
+
+    counts["evaluation_eligible"] = (
+        counts["evaluation_coverage"] >= cfg.coverage_threshold
+    )
+    return counts.reset_index()[
+        [
+            "user",
+            "discovery_bins",
+            "evaluation_bins",
+            "discovery_coverage",
+            "discovery_eligible",
+            "evaluation_coverage",
+            "evaluation_eligible",
+        ]
+    ]
+
+#Private function to order pairs and remove sentinel rows
+def _unordered_pairs(frame):
+    result = frame.loc[frame["user_b"] >= 0].copy()
+
+    endpoints = result[PAIR].to_numpy()
+    result["user_a"] = endpoints.min(axis=1)
+    result["user_b"] = endpoints.max(axis=1)
+
+    return result
 
 def aggregate_pairs(bt: pd.DataFrame, calls: pd.DataFrame, sms: pd.DataFrame,
                     period: int, cfg: Config) -> pd.DataFrame:
@@ -171,7 +209,72 @@ def aggregate_pairs(bt: pd.DataFrame, calls: pd.DataFrame, sms: pd.DataFrame,
     Example: 40 proximity bins on one day -> bins=40, days=1, not 40 days.
     Alice seeing Bob and Bob seeing Alice in one bin must count only once.
     """
-    raise NotImplementedError("Processing task 3: aggregate_pairs")
+
+    
+    #Select only the requested period
+    bt_period = bt.loc[bt["period"].eq(period)].copy()
+    calls_period = calls.loc[calls["period"].eq(period)].copy()
+    sms_period = sms.loc[sms["period"].eq(period)].copy()
+    bt_period = _unordered_pairs(bt_period)
+
+    bt_period = (
+      bt_period
+      .groupby(PAIR + ["bin"], as_index=False)
+      .agg(
+          rssi=("rssi", "max"),
+          day=("day", "first"),
+      )
+    )
+    #Keep only rows with RSSI above the threshold
+    bt_period = bt_period.loc[
+      bt_period["rssi"].ge(cfg.rssi_threshold)
+    ]
+    #Aggregate proximity bins and days per pair
+    proximity = bt_period.groupby(PAIR).agg(
+      proximity_bins=("bin", "size"),
+      proximity_days=("day", "nunique"),
+    )
+
+    #Aggregate SMS counts and days per pair
+    sms_period = _unordered_pairs(sms_period)
+    sms_summary = sms_period.groupby(PAIR).agg(
+      sms_count=("timestamp", "size"),
+      sms_days=("day", "nunique"),
+    )
+
+    #Aggregate completed calls and days per pair
+    calls_period = _unordered_pairs(calls_period)
+    call_attempts = (
+      calls_period
+      .groupby(PAIR)
+      .size()
+      .rename("call_attempts")
+      .to_frame()
+    )
+    #Aggregate completed calls and days per pair
+    completed = calls_period.loc[
+      calls_period["duration"].gt(0)
+    ]
+    completed_summary = completed.groupby(PAIR).agg(
+        completed_calls=("timestamp", "size"),
+        call_days=("day", "nunique"),
+    )
+
+    #Combine all aggregates into a single DataFrame, filling missing values with zero
+    combined = pd.concat(
+      [
+          proximity,
+          sms_summary,
+          completed_summary,
+          call_attempts,
+      ],
+      axis=1,
+      join="outer",
+    )
+    combined = combined.fillna(0).astype("int64")
+    result = combined.reset_index()
+    return result[PAIR + FEATURES].sort_values(PAIR).reset_index(drop=True)
+
 
 
 def run(raw: Path, cfg: Config) -> ProcessedData:
@@ -188,12 +291,49 @@ def run(raw: Path, cfg: Config) -> ProcessedData:
     The CLI handles saving these tables. No need to implement file handoffs here.
     First acceptance check: python -m pytest tests/test_exercises.py -q
     """
+    #Read the three CSVs (bt_symmetric.csv, calls.csv, sms.csv) with pandas
     bt_sym = pd.read_csv(raw / "bt_symmetric.csv")
     calls = pd.read_csv(raw / "calls.csv")
     sms = pd.read_csv(raw / "sms.csv")
+
+    #clean the csvs using clean_records
     clean_bt = clean_records(bt_sym, "bt", cfg)
     clean_calls = clean_records(calls, "calls", cfg)
     clean_sms = clean_records(sms, "sms", cfg)
 
-    raise NotImplementedError("Processing task 4: run")
+    #Compute observation coverage for each student across both periods
+    coverage = observation_coverage(clean_bt, cfg)
 
+    discovery_pairs = aggregate_pairs(
+        clean_bt, clean_calls, clean_sms, 0, cfg
+    )
+
+    evaluation_pairs = aggregate_pairs(
+        clean_bt, clean_calls, clean_sms, 1, cfg
+    )
+
+    # Build pair_population from ANY cleaned discovery-period pair interaction,
+    # including weak Bluetooth and missed calls. Exclude sentinel IDs and duplicates.
+    pair_tables = []
+
+    for events in [clean_bt, clean_calls, clean_sms]:
+        discovery_events = events.loc[events["period"].eq(0)]
+
+        unordered = _unordered_pairs(discovery_events)
+
+        pair_tables.append(unordered[PAIR])
+
+    pair_population = (
+        pd.concat(pair_tables, ignore_index=True)
+        .drop_duplicates(PAIR)
+        .sort_values(PAIR)
+        .reset_index(drop=True)
+    )
+
+
+    return ProcessedData(
+      discovery_pairs=discovery_pairs,
+      evaluation_pairs=evaluation_pairs,
+      coverage=coverage,
+      pair_population=pair_population,
+    )
