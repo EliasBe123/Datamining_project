@@ -13,11 +13,11 @@ class Config:
     recurrence_days: int = 3
     many_proximity_bins: int = 12
     min_rule_count: int = 20
-    min_confidence: float = 0.6
-    min_lift: float = 1.0
+    min_confidence: float = 1.0
+    min_lift: float = 0.0
     max_itemset_size: int = 3
     distance_cutoff: float = 0.8
-    min_group_size: int = 3
+    min_group_size: int = 10
     combined_weights: tuple = (0.8, 0.1, 0.1)
     permutations: int = 1000
     seed: int = 42

@@ -122,6 +122,7 @@ def run(data: ProcessedData, cfg: Config) -> RuleResults:
       "support_count": (frequent.support * n_pairs).round().astype(int),
     })
     
+    print("CONFIG CONFIDENCE:", cfg.min_confidence)
     rules = association_rules(frequent, metric="confidence", min_threshold=cfg.min_confidence)
     rules = rules[rules.lift > cfg.min_lift]
 
