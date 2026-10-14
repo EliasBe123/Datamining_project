@@ -9,56 +9,20 @@ import matplotlib.pyplot as plt
 from .config import Config
 from .contracts import ClusteringResults, ProcessedData
 
-
-# ---------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------
-
 MEMBERSHIP_COLUMNS = [
     "user_id",
-    "variant",
     "cluster",
     "cluster_size",
-    "kind",
 ]
 
-GROUP_COLUMNS = [
-    "variant",
-    "cluster",
-    "group_size",
-    "possible_pairs",
-    "evaluated_pairs",
-    "excluded_pairs",
-    "initially_recurring_pairs",
-    "later_recurring_pairs",
-    "retained_pairs",
-    "later_communication_pairs",
-    "connectivity",
-    "retention",
-    "later_communication_rate",
-    "null_mean",
-    "null_low",
-    "null_high",
-    "permutation_p",
-]
-
-EDGE_THRESHOLD = 0.35
-
-
-# ---------------------------------------------------------------------
-# Similarity matrix
-# ---------------------------------------------------------------------
+EDGE_THRESHOLD = 0.4
 
 def similarity_matrix(
     pairs: pd.DataFrame,
     users: list,
-    variant: str,
     cfg: Config,
 ) -> pd.DataFrame:
-    """Construct a symmetric similarity matrix for the selected variant."""
 
-    if variant not in {"bluetooth", "combined"}:
-        raise ValueError("variant must be 'bluetooth' or 'combined'")
 
     if cfg.period_days <= 0:
         raise ValueError("period_days must be positive")
@@ -67,32 +31,12 @@ def similarity_matrix(
 
     if len(users) != len(set(users)):
         raise ValueError("Duplicate user IDs supplied")
+    weights = cfg.combined_weights
 
-    required = {"user_a", "user_b", "proximity_days"}
-    missing = required - set(pairs.columns)
-
-    if missing:
-        raise ValueError(f"Missing columns: {sorted(missing)}")
-
-    if variant == "combined":
-        missing = {"call_days", "sms_days"} - set(pairs.columns)
-
-        if missing:
-            raise ValueError(
-                f"Missing combined columns: {sorted(missing)}"
-            )
-
-        weights = tuple(cfg.combined_weights)
-
-        if (
-            len(weights) != 3
-            or any(w < 0 for w in weights)
-            or not np.isclose(sum(weights), 1.0)
-        ):
-            raise ValueError(
-                "combined_weights must contain three nonnegative "
-                "weights summing to 1"
-            )
+    if not np.isclose(sum(weights), 1.0):
+        raise ValueError(
+            "weights not summing to 1"
+        )
 
     matrix = pd.DataFrame(
         0.0,
@@ -117,49 +61,21 @@ def similarity_matrix(
             ["user_a", "user_b"]
         ].max(axis=1)
 
-        if relevant.duplicated(["_low", "_high"]).any():
-            raise ValueError(
-                "Duplicate unordered user pairs found. "
-                "Aggregate the pairs before clustering."
-            )
+        bluetooth = pd.to_numeric(relevant["proximity_days"], errors="raise")/ cfg.period_days
 
-        bluetooth = (
-            pd.to_numeric(
-                relevant["proximity_days"], errors="raise"
-            )
-            .fillna(0)
-            .clip(0, cfg.period_days)
-            / cfg.period_days
+        calls = pd.to_numeric(relevant["call_days"], errors="raise")/ cfg.period_days
+        
+
+        sms = pd.to_numeric(relevant["sms_days"], errors="raise")/ cfg.period_days
+        
+
+        w_bluetooth, w_calls, w_sms = weights
+
+        similarities = (
+            w_bluetooth * bluetooth
+            + w_calls * calls
+            + w_sms * sms
         )
-
-        if variant == "bluetooth":
-            similarities = bluetooth
-        else:
-            calls = (
-                pd.to_numeric(
-                    relevant["call_days"], errors="raise"
-                )
-                .fillna(0)
-                .clip(0, cfg.period_days)
-                / cfg.period_days
-            )
-
-            sms = (
-                pd.to_numeric(
-                    relevant["sms_days"], errors="raise"
-                )
-                .fillna(0)
-                .clip(0, cfg.period_days)
-                / cfg.period_days
-            )
-
-            w_bluetooth, w_calls, w_sms = cfg.combined_weights
-
-            similarities = (
-                w_bluetooth * bluetooth
-                + w_calls * calls
-                + w_sms * sms
-            )
 
         for a, b, value in zip(
             relevant["user_a"],
@@ -171,42 +87,15 @@ def similarity_matrix(
             matrix.loc[b, a] = value
 
     np.fill_diagonal(matrix.values, 1.0)
-
-    values = matrix.to_numpy()
-
-    if not np.isfinite(values).all():
-        raise ValueError("Similarity matrix contains invalid values")
-
-    if not np.allclose(values, values.T):
-        raise ValueError("Similarity matrix is not symmetric")
-
+    
     return matrix
-
-
-# ---------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------
 
 def build_graph(
     matrix: pd.DataFrame,
     edge_threshold: float = EDGE_THRESHOLD,
 ) -> ig.Graph:
-    """Build an undirected weighted graph, retaining isolated vertices."""
-
-    if not 0 <= edge_threshold <= 1:
-        raise ValueError("edge_threshold must be in [0, 1]")
-
     values = matrix.to_numpy(dtype=float)
     users = list(matrix.index)
-
-    if values.shape != (len(users), len(users)):
-        raise ValueError("Similarity matrix must be square")
-
-    if not np.isfinite(values).all():
-        raise ValueError("Similarity matrix contains non-finite values")
-
-    if not np.allclose(values, values.T):
-        raise ValueError("Similarity matrix must be symmetric")
 
     graph = ig.Graph(n=len(users), directed=False)
 
@@ -230,25 +119,15 @@ def build_graph(
     return graph
 
 
-# ---------------------------------------------------------------------
-# Leiden community detection
-# ---------------------------------------------------------------------
+
+# community detection
+# -----------------------------------
 
 def calculate_modularity(
     matrix: pd.DataFrame,
-    variant: str,
     cfg: Config,
 ) -> tuple[pd.DataFrame, float, ig.Graph]:
-    """Run Leiden, remove singleton communities, and return the results."""
-
     graph = build_graph(matrix)
-
-    if graph.vcount() == 0:
-        return (
-            pd.DataFrame(columns=MEMBERSHIP_COLUMNS),
-            float("nan"),
-            graph,
-        )
 
     if graph.ecount() == 0:
         # With no edges, every vertex is a singleton.
@@ -270,12 +149,11 @@ def calculate_modularity(
             weights="weight",
         )
 
-    # Store the original Leiden memberships before filtering.
+    # Store the memberships before filtering.
     graph.vs["cluster"] = membership
 
     members = pd.DataFrame({
         "user_id": graph.vs["user_id"],
-        "variant": variant,
         "cluster": membership,
     })
 
@@ -283,16 +161,7 @@ def calculate_modularity(
         members.groupby("cluster")["user_id"].transform("size")
     )
 
-    members["kind"] = np.select(
-        [
-            members["cluster_size"] >= cfg.min_group_size,
-            members["cluster_size"] == 2,
-        ],
-        ["group", "pair"],
-        default="singleton",
-    )
-
-    # Remove singleton communities from both the output and displayed graph.
+    # Remove singleton communities.
     community_sizes = pd.Series(membership).value_counts()
 
     keep_vertices = [
@@ -304,25 +173,17 @@ def calculate_modularity(
     graph = graph.induced_subgraph(keep_vertices)
 
     members = members.loc[members["cluster_size"] > 1].copy()
-    print(members.loc[members["cluster"] == 1, "user_id"].tolist())
-    # Recalculate sizes and kinds for the retained membership table.
+    
+    # Recalculate sizes since we removed singletons
     if not members.empty:
         members["cluster_size"] = (
             members.groupby("cluster")["user_id"].transform("size")
         )
 
-        members["kind"] = np.where(
-            members["cluster_size"] >= cfg.min_group_size,
-            "group",
-            "pair",
-        )
-
-    print(f"\n[{variant}]")
     print(f"Vertices after singleton removal: {graph.vcount()}")
     print(f"Edges: {graph.ecount()}")
     print(f"Edge threshold: {EDGE_THRESHOLD}")
     print(f"Communities retained: {members['cluster'].nunique()}")
-
     print(
         "Community sizes:",
         members["cluster"]
@@ -331,39 +192,23 @@ def calculate_modularity(
         .tolist(),
     )
 
-    if np.isfinite(modularity):
-        print(f"Modularity before singleton removal: {modularity:.4f}")
-    else:
-        print("Modularity undefined (no edges)")
-
     return members[MEMBERSHIP_COLUMNS], modularity, graph
 
 
-# ---------------------------------------------------------------------
-# Graph visualisation
-# ---------------------------------------------------------------------
+# graph visualisation
+# --------------------------------
 
 def show_igraph(
     graph: ig.Graph,
-    variant: str,
     type: str,
-) -> None:
-    """Display the graph with consistent community colors using Matplotlib."""
-
-    if graph.vcount() == 0:
-        print(f"[{variant}] No non-singleton communities to display.")
-        return
-
-    if "cluster" not in graph.vs.attributes():
-        raise ValueError("Graph is missing its 'cluster' vertex attribute")
-
+    modularity: float,
+):
     clusters = graph.vs["cluster"]
 
-    # Map every distinct Leiden community ID to exactly one color.
+    # map every Leiden community ID to exactly one color.
     unique_clusters = sorted(set(clusters))
     number_of_clusters = len(unique_clusters)
 
-    # tab20 is a qualitative palette designed for distinct categories.
     cmap = plt.get_cmap("tab20", max(number_of_clusters, 1))
 
     cluster_colors = {
@@ -380,7 +225,7 @@ def show_igraph(
 
     fig, ax = plt.subplots(figsize=(14, 10))
 
-    # Draw edges first.
+    # draw edges first.
     for edge in graph.es:
         source, target = edge.tuple
 
@@ -398,7 +243,7 @@ def show_igraph(
             zorder=1,
         )
 
-    # Every vertex in the same community receives the same color.
+    # every vertex in the same community receives the same color.
     ax.scatter(
         positions[:, 0],
         positions[:, 1],
@@ -409,7 +254,7 @@ def show_igraph(
         zorder=2,
     )
 
-    # Label vertices with user IDs.
+    # label vertices with user IDs.
     for i, user in enumerate(graph.vs["name"]):
         ax.annotate(
             str(user),
@@ -422,45 +267,44 @@ def show_igraph(
 
     ax.set_title(
         f"{type} "
-        f"{variant.capitalize()} Similarity Graph "
+        f"Similarity Graph "
         f"({graph.vcount()} students, {graph.ecount()} edges, "
-        f"{number_of_clusters} communities)"
+        f"{number_of_clusters} communities) "
+        f"\nedge threshold: {EDGE_THRESHOLD}, "
+        f"Modularity: {modularity}"
     )
 
     ax.axis("off")
     fig.tight_layout()
 
-
-# ---------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------
+# evaluation and plotting
+# -----------------------------------------------------
 
 
 def compare_communities_jaccard(members_a, members_b, threshold = 0.1):
-    """Compare communities using Jaccard similarity."""
-
     communities_a = {
-        cluster: set(group["user_id"])
-        for cluster, group in members_a.groupby("cluster")
+        cluster: set(group["user_id"]) for cluster, group in members_a.groupby("cluster")
     }
 
     communities_b = {
-        cluster: set(group["user_id"])
-        for cluster, group in members_b.groupby("cluster")
+        cluster: set(group["user_id"]) for cluster, group in members_b.groupby("cluster")
     }
 
     results = []
+    total_similarity = 0.0
+    total_pairings = 0
 
     for cluster_a, users_a in communities_a.items():
         for cluster_b, users_b in communities_b.items():
             intersection = users_a & users_b
 
-            # Skip community pairs with no shared users.
             if not intersection:
                 continue
 
             union = users_a | users_b
             similarity = len(intersection) / len(union)
+            total_similarity += similarity
+            total_pairings+=1
             
             if similarity < threshold:
                 continue
@@ -478,89 +322,42 @@ def compare_communities_jaccard(members_a, members_b, threshold = 0.1):
     return (
         pd.DataFrame(results)
         .sort_values("jaccard", ascending=False)
-        .reset_index(drop=True)
+        .reset_index(drop=True),
+        total_similarity/total_pairings
     )
 
 def plot_jaccard_comparison(
     members_a: pd.DataFrame,
     members_b: pd.DataFrame,
     comparison: pd.DataFrame,
-    variant: str,
-    top_n: int = 15,
+    average_similarity: int,
 ) -> None:
-    """Plot matching communities using a bar chart and heatmap."""
+    """Plot matching communities using a heatmap."""
 
-    # Build community-to-user mappings.
-    communities_a = {
-        cluster: set(group["user_id"])
-        for cluster, group in members_a.groupby("cluster")
-    }
+    # communities_a = (members_a["cluster"].unique().tolist())
+    # communities_b = (members_b["cluster"].unique().tolist())
+    communities_a = sorted(members_a["cluster"].unique().tolist())
+    communities_b = sorted(members_b["cluster"].unique().tolist())
 
-    communities_b = {
-        cluster: set(group["user_id"])
-        for cluster, group in members_b.groupby("cluster")
-    }
-
-    if not communities_a or not communities_b:
-        print(f"[{variant}] No communities available to compare.")
-        return
-
-    # ---------------------------------------------------------
-    # 1. Bar chart: strongest community matches
-    # ---------------------------------------------------------
-
-    if comparison.empty:
-        print(f"[{variant}] No matches pass the Jaccard threshold.")
-    else:
-        top = comparison.head(top_n).copy()
-
-        top["pair"] = (
-            "A:" + top["cluster_a"].astype(str)
-            + " - B:" + top["cluster_b"].astype(str)
-        )
-
-        top = top.sort_values("jaccard")
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        ax.barh(top["pair"], top["jaccard"])
-
-        ax.set_xlabel("Jaccard similarity")
-        ax.set_ylabel("Community pair")
-        ax.set_xlim(0, 1)
-        ax.set_title(
-            f"{variant.capitalize()}: Top {len(top)} "
-            "community matches"
-        )
-
-        fig.tight_layout()
-
-    # ---------------------------------------------------------
-    # 2. Heatmap: all community pairs, including zero overlap
-    # ---------------------------------------------------------
-
+    # Create a matrix initialized to zero, so unmatched pairs are 0
     similarity_matrix = pd.DataFrame(
         0.0,
-        index=list(communities_a.keys()),
-        columns=list(communities_b.keys()),
+        index=communities_a,
+        columns=communities_b,
     )
 
-    for cluster_a, users_a in communities_a.items():
-        for cluster_b, users_b in communities_b.items():
-            union = users_a | users_b
+    if not comparison.empty:
+        for row in comparison.itertuples(index=False):
+            similarity_matrix.loc[
+                row.cluster_a, row.cluster_b
+            ] = row.jaccard
 
-            if union:
-                similarity_matrix.loc[
-                    cluster_a, cluster_b
-                ] = len(users_a & users_b) / len(union)
-
-    # Adapt figure size to the number of communities.
+    # matplotlib shit
+    #-------------------------------
     fig_width = max(10, len(communities_b) * 0.35)
     fig_height = max(7, len(communities_a) * 0.30)
 
-    fig, ax = plt.subplots(
-        figsize=(fig_width, fig_height)
-    )
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
     image = ax.imshow(
         similarity_matrix.to_numpy(),
@@ -572,55 +369,23 @@ def plot_jaccard_comparison(
     )
 
     ax.set_xticks(range(len(communities_b)))
-    ax.set_xticklabels(
-        list(communities_b.keys()),
-        rotation=90,
-        fontsize=7,
-    )
+    ax.set_xticklabels(communities_b, rotation=90, fontsize=7)
 
     ax.set_yticks(range(len(communities_a)))
-    ax.set_yticklabels(
-        list(communities_a.keys()),
-        fontsize=7,
-    )
+    ax.set_yticklabels(communities_a, fontsize=7)
 
     ax.set_xlabel("Evaluation community")
     ax.set_ylabel("Discovery community")
-    ax.set_title(
-        f"{variant.capitalize()}: Community Jaccard similarity"
-    )
+    ax.set_title("Community Jaccard similarity "
+                 f"\nAverage similarity: {average_similarity}")
 
-    fig.colorbar(
-        image,
-        ax=ax,
-        label="Jaccard similarity",
-    )
-
+    fig.colorbar(image, ax=ax, label="Jaccard similarity")
     fig.tight_layout()
-
-def evaluate_groups(
-    members: pd.DataFrame,
-    data: ProcessedData,
-    cfg: Config,
-) -> pd.DataFrame:
-    """
-    Placeholder for later-period persistence evaluation.
-
-    Implement the evaluation before interpreting persistence results.
-    """
-
-    return pd.DataFrame(columns=GROUP_COLUMNS)
-
-
-# ---------------------------------------------------------------------
-# Pipeline entry point
-# ---------------------------------------------------------------------
 
 def run(
     data: ProcessedData,
     cfg: Config,
 ) -> ClusteringResults:
-    """Cluster both variants, then display both graphs."""
 
     discovery = data.discovery_pairs
     evaluation = data.evaluation_pairs
@@ -632,81 +397,53 @@ def run(
     )
 
     evaluation_all_memberships = []
-    evaluation_all_evaluations = []
-    evaluation_graphs = {}
     
     discovery_all_memberships = []
-    discovery_all_evaluations = []
-    discovery_graphs = {}
 
-    for variant in ("bluetooth", "combined"):
-        discovery_matrix = similarity_matrix(
-            discovery,
-            users,
-            variant,
-            cfg,
-        )
-        
-        evaluation_matrix = similarity_matrix(
-            evaluation,
-            users,
-            variant,
-            cfg,
-        )
+    
+    discovery_matrix = similarity_matrix(
+        discovery,
+        users,
+        cfg,
+    )
+    
+    evaluation_matrix = similarity_matrix(
+        evaluation,
+        users,
+        cfg,
+    )
 
-        discovery_members, modularity, discovery_graph = calculate_modularity(
-            discovery_matrix,
-            variant,
-            cfg,
-        )
-        
-        evaluation_members, modularity, evaluation_graph = calculate_modularity(
-            evaluation_matrix,
-            variant,
-            cfg,
-        )
+    discovery_members, discovery_modularity, discovery_graph = calculate_modularity(
+        discovery_matrix,
+        cfg,
+    )
+    
+    evaluation_members, evaluation_modularity, evaluation_graph = calculate_modularity(
+        evaluation_matrix,
+        cfg,
+    )
 
-        discovery_all_memberships.append(discovery_members)
-        evaluation_all_memberships.append(evaluation_members)
+    discovery_all_memberships.append(discovery_members)
+    evaluation_all_memberships.append(evaluation_members)
+    
+    comparison, average_similarity = compare_communities_jaccard(discovery_members, evaluation_members)
+    print(f"\nJaccard comparison: ")
+    print(comparison.to_string(index=False))
 
-        discovery_all_evaluations.append(
-            evaluate_groups(discovery_members, data, cfg)
-        )
-        evaluation_all_evaluations.append(
-            evaluate_groups(evaluation_members, data, cfg)
-        )
-
-        discovery_graphs[variant] = discovery_graph
-        evaluation_graphs[variant] = evaluation_graph
-        
-        comparison = compare_communities_jaccard(discovery_members, evaluation_members)
-        print(f"\nJaccard comparison: {variant}")
-        print(comparison.to_string(index=False))
-
-        plot_jaccard_comparison(
-            members_a=discovery_members,
-            members_b=evaluation_members,
-            comparison=comparison,
-            variant=variant,
-            top_n=15,
-        )
+    plot_jaccard_comparison(
+        discovery_members,
+        evaluation_members,
+        comparison,
+        average_similarity,
+    )
 
     discovery_memberships = pd.concat(
         discovery_all_memberships,
         ignore_index=True,
     )
     
-    evaluation_memberships = pd.concat(
-        evaluation_all_memberships,
-        ignore_index=True,
-    )
-    
-
-    # for variant, graph in discovery_graphs.items():
-    #     show_igraph(graph, variant, "discovery")
-        
-    # for variant, graph in evaluation_graphs.items():
-    #     show_igraph(graph, variant, "evaluation")
+    show_igraph(discovery_graph, "discovery", discovery_modularity)
+    show_igraph(evaluation_graph, "evaluation", evaluation_modularity)
 
     plt.show()
 
