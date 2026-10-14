@@ -42,7 +42,7 @@ GROUP_COLUMNS = [
     "permutation_p",
 ]
 
-EDGE_THRESHOLD = 0.20
+EDGE_THRESHOLD = 0.35
 
 
 # ---------------------------------------------------------------------
@@ -304,7 +304,7 @@ def calculate_modularity(
     graph = graph.induced_subgraph(keep_vertices)
 
     members = members.loc[members["cluster_size"] > 1].copy()
-
+    print(members.loc[members["cluster"] == 1, "user_id"].tolist())
     # Recalculate sizes and kinds for the retained membership table.
     if not members.empty:
         members["cluster_size"] = (
@@ -421,7 +421,7 @@ def show_igraph(
         )
 
     ax.set_title(
-        f"{type}"
+        f"{type} "
         f"{variant.capitalize()} Similarity Graph "
         f"({graph.vcount()} students, {graph.ecount()} edges, "
         f"{number_of_clusters} communities)"
@@ -434,6 +434,169 @@ def show_igraph(
 # ---------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------
+
+
+def compare_communities_jaccard(members_a, members_b, threshold = 0.1):
+    """Compare communities using Jaccard similarity."""
+
+    communities_a = {
+        cluster: set(group["user_id"])
+        for cluster, group in members_a.groupby("cluster")
+    }
+
+    communities_b = {
+        cluster: set(group["user_id"])
+        for cluster, group in members_b.groupby("cluster")
+    }
+
+    results = []
+
+    for cluster_a, users_a in communities_a.items():
+        for cluster_b, users_b in communities_b.items():
+            intersection = users_a & users_b
+
+            # Skip community pairs with no shared users.
+            if not intersection:
+                continue
+
+            union = users_a | users_b
+            similarity = len(intersection) / len(union)
+            
+            if similarity < threshold:
+                continue
+
+            results.append({
+                "cluster_a": cluster_a,
+                "cluster_b": cluster_b,
+                "shared_users": len(intersection),
+                "size_a": len(users_a),
+                "size_b": len(users_b),
+                "jaccard": similarity,
+                "shared_user_ids": sorted(intersection),
+            })
+
+    return (
+        pd.DataFrame(results)
+        .sort_values("jaccard", ascending=False)
+        .reset_index(drop=True)
+    )
+
+def plot_jaccard_comparison(
+    members_a: pd.DataFrame,
+    members_b: pd.DataFrame,
+    comparison: pd.DataFrame,
+    variant: str,
+    top_n: int = 15,
+) -> None:
+    """Plot matching communities using a bar chart and heatmap."""
+
+    # Build community-to-user mappings.
+    communities_a = {
+        cluster: set(group["user_id"])
+        for cluster, group in members_a.groupby("cluster")
+    }
+
+    communities_b = {
+        cluster: set(group["user_id"])
+        for cluster, group in members_b.groupby("cluster")
+    }
+
+    if not communities_a or not communities_b:
+        print(f"[{variant}] No communities available to compare.")
+        return
+
+    # ---------------------------------------------------------
+    # 1. Bar chart: strongest community matches
+    # ---------------------------------------------------------
+
+    if comparison.empty:
+        print(f"[{variant}] No matches pass the Jaccard threshold.")
+    else:
+        top = comparison.head(top_n).copy()
+
+        top["pair"] = (
+            "A:" + top["cluster_a"].astype(str)
+            + " - B:" + top["cluster_b"].astype(str)
+        )
+
+        top = top.sort_values("jaccard")
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        ax.barh(top["pair"], top["jaccard"])
+
+        ax.set_xlabel("Jaccard similarity")
+        ax.set_ylabel("Community pair")
+        ax.set_xlim(0, 1)
+        ax.set_title(
+            f"{variant.capitalize()}: Top {len(top)} "
+            "community matches"
+        )
+
+        fig.tight_layout()
+
+    # ---------------------------------------------------------
+    # 2. Heatmap: all community pairs, including zero overlap
+    # ---------------------------------------------------------
+
+    similarity_matrix = pd.DataFrame(
+        0.0,
+        index=list(communities_a.keys()),
+        columns=list(communities_b.keys()),
+    )
+
+    for cluster_a, users_a in communities_a.items():
+        for cluster_b, users_b in communities_b.items():
+            union = users_a | users_b
+
+            if union:
+                similarity_matrix.loc[
+                    cluster_a, cluster_b
+                ] = len(users_a & users_b) / len(union)
+
+    # Adapt figure size to the number of communities.
+    fig_width = max(10, len(communities_b) * 0.35)
+    fig_height = max(7, len(communities_a) * 0.30)
+
+    fig, ax = plt.subplots(
+        figsize=(fig_width, fig_height)
+    )
+
+    image = ax.imshow(
+        similarity_matrix.to_numpy(),
+        cmap="viridis",
+        vmin=0,
+        vmax=1,
+        aspect="auto",
+        interpolation="nearest",
+    )
+
+    ax.set_xticks(range(len(communities_b)))
+    ax.set_xticklabels(
+        list(communities_b.keys()),
+        rotation=90,
+        fontsize=7,
+    )
+
+    ax.set_yticks(range(len(communities_a)))
+    ax.set_yticklabels(
+        list(communities_a.keys()),
+        fontsize=7,
+    )
+
+    ax.set_xlabel("Evaluation community")
+    ax.set_ylabel("Discovery community")
+    ax.set_title(
+        f"{variant.capitalize()}: Community Jaccard similarity"
+    )
+
+    fig.colorbar(
+        image,
+        ax=ax,
+        label="Jaccard similarity",
+    )
+
+    fig.tight_layout()
 
 def evaluate_groups(
     members: pd.DataFrame,
@@ -515,6 +678,18 @@ def run(
 
         discovery_graphs[variant] = discovery_graph
         evaluation_graphs[variant] = evaluation_graph
+        
+        comparison = compare_communities_jaccard(discovery_members, evaluation_members)
+        print(f"\nJaccard comparison: {variant}")
+        print(comparison.to_string(index=False))
+
+        plot_jaccard_comparison(
+            members_a=discovery_members,
+            members_b=evaluation_members,
+            comparison=comparison,
+            variant=variant,
+            top_n=15,
+        )
 
     discovery_memberships = pd.concat(
         discovery_all_memberships,
@@ -525,26 +700,17 @@ def run(
         evaluation_all_memberships,
         ignore_index=True,
     )
-
-    evaluation_group_evaluation = pd.concat(
-        evaluation_all_evaluations,
-        ignore_index=True,
-    )
     
-    discovery_group_evaluation = pd.concat(
-        discovery_all_evaluations,
-        ignore_index=True,
-    )
 
-    for variant, graph in discovery_graphs.items():
-        show_igraph(graph, variant, "discovery")
+    # for variant, graph in discovery_graphs.items():
+    #     show_igraph(graph, variant, "discovery")
         
-    for variant, graph in evaluation_graphs.items():
-        show_igraph(graph, variant, "evaluation")
+    # for variant, graph in evaluation_graphs.items():
+    #     show_igraph(graph, variant, "evaluation")
 
     plt.show()
 
     return ClusteringResults(
         memberships=discovery_memberships,
-        group_evaluation=discovery_group_evaluation,
+        group_evaluation=False,
     )
